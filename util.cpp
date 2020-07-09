@@ -293,7 +293,7 @@ static size_t upload_data_cb(void *ptr, size_t size, size_t nmemb,
 static int seek_data_cb(void *user_data, curl_off_t offset, int origin)
 {
 	struct upload_buffer *ub = (struct upload_buffer *)user_data;
-	
+
 	switch (origin) {
 	case SEEK_SET:
 		ub->pos = (size_t)offset;
@@ -385,7 +385,7 @@ static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
 	DWORD outputBytes;
 #endif
 
-#ifndef WIN32	
+#ifndef WIN32
 	if (unlikely(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive,
 		sizeof(keepalive))))
 		return 1;
@@ -409,7 +409,7 @@ static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
 	struct tcp_keepalive vals;
 	vals.onoff = 1;
 	vals.keepalivetime = tcp_keepidle * 1000;
-	vals.keepaliveinterval = tcp_keepintvl * 1000;	
+	vals.keepaliveinterval = tcp_keepintvl * 1000;
 	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals),
 		NULL, 0, &outputBytes, NULL, NULL)))
 		return 1;
@@ -757,6 +757,164 @@ bool hex2bin(void *output, const char *hexstr, size_t len)
 	return (len == 0 && *hexstr == 0) ? true : false;
 }
 
+
+
+int varint_encode(unsigned char *p, uint64_t n)
+{
+	int i;
+	if (n < 0xfd) {
+		p[0] = (uchar)n;
+		return 1;
+	}
+	if (n <= 0xffff) {
+		p[0] = 0xfd;
+		p[1] = n & 0xff;
+		p[2] = (uchar)(n >> 8);
+		return 3;
+	}
+	if (n <= 0xffffffff) {
+		p[0] = 0xfe;
+		for (i = 1; i < 5; i++) {
+			p[i] = n & 0xff;
+			n >>= 8;
+		}
+		return 5;
+	}
+	p[0] = 0xff;
+	for (i = 1; i < 9; i++) {
+		p[i] = n & 0xff;
+		n >>= 8;
+	}
+	return 9;
+}
+
+static const char b58digits[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+static bool b58dec(unsigned char *bin, size_t binsz, const char *b58)
+{
+	size_t i, j;
+	uint64_t t;
+	uint32_t c;
+	uint32_t *outi;
+	size_t outisz = (binsz + 3) / 4;
+	int rem = binsz % 4;
+	uint32_t remmask = 0xffffffff << (8 * rem);
+	size_t b58sz = strlen(b58);
+	bool rc = false;
+
+	outi = (uint32_t *)calloc(outisz, sizeof(*outi));
+
+	for (i = 0; i < b58sz; ++i) {
+		for (c = 0; b58digits[c] != b58[i]; c++)
+			if (!b58digits[c])
+				goto out;
+		for (j = outisz; j--; ) {
+			t = (uint64_t)outi[j] * 58 + c;
+			c = t >> 32;
+			outi[j] = t & 0xffffffff;
+		}
+		if (c || outi[0] & remmask)
+			goto out;
+	}
+
+	j = 0;
+	switch (rem) {
+	case 3:
+		*(bin++) = (outi[0] >> 16) & 0xff;
+	case 2:
+		*(bin++) = (outi[0] >> 8) & 0xff;
+	case 1:
+		*(bin++) = outi[0] & 0xff;
+		++j;
+	default:
+		break;
+	}
+	for (; j < outisz; ++j) {
+		be32enc((uint32_t *)bin, outi[j]);
+		bin += sizeof(uint32_t);
+	}
+
+	rc = true;
+out:
+	free(outi);
+	return rc;
+}
+
+static int b58check(unsigned char *bin, size_t binsz, const char *b58)
+{
+	unsigned char buf[32];
+	int i;
+
+	sha256d(buf, bin, (int)(binsz - 4));
+	if (memcmp(&bin[binsz - 4], buf, 4))
+		return -1;
+
+	/* Check number of zeros is correct AFTER verifying checksum
+	* (to avoid possibility of accessing the string beyond the end) */
+	for (i = 0; bin[i] == '\0' && b58[i] == '1'; ++i);
+	if (bin[i] == '\0' || b58[i] == '1')
+		return -3;
+
+	return bin[0];
+}
+
+
+bool jobj_binary(const json_t *obj, const char *key, void *buf, size_t buflen)
+{
+	const char *hexstr;
+	json_t *tmp;
+
+	tmp = json_object_get(obj, key);
+	if (unlikely(!tmp)) {
+		applog(LOG_ERR, "JSON key '%s' not found", key);
+		return false;
+	}
+	hexstr = json_string_value(tmp);
+	if (unlikely(!hexstr)) {
+		applog(LOG_ERR, "JSON key '%s' is not a string", key);
+		return false;
+	}
+	if (!hex2bin((uchar*)buf, hexstr, buflen))
+		return false;
+
+	return true;
+}
+
+
+size_t address_to_script(unsigned char *out, size_t outsz, const char *addr)
+{
+	unsigned char addrbin[25];
+	int addrver;
+	size_t rv;
+
+	if (!b58dec(addrbin, sizeof(addrbin), addr))
+		return 0;
+	addrver = b58check(addrbin, sizeof(addrbin), addr);
+	if (addrver < 0)
+		return 0;
+	switch (addrver) {
+	case 5:    /* Bitcoin script hash */
+	case 196:  /* Testnet script hash */
+		if (outsz < (rv = 23))
+			return rv;
+		out[0] = 0xa9;  /* OP_HASH160 */
+		out[1] = 0x14;  /* push 20 bytes */
+		memcpy(&out[2], &addrbin[1], 20);
+		out[22] = 0x87;  /* OP_EQUAL */
+		return rv;
+	default:
+		if (outsz < (rv = 25))
+			return rv;
+		out[0] = 0x76;  /* OP_DUP */
+		out[1] = 0xa9;  /* OP_HASH160 */
+		out[2] = 0x14;  /* push 20 bytes */
+		memcpy(&out[3], &addrbin[1], 20);
+		out[23] = 0x88;  /* OP_EQUALVERIFY */
+		out[24] = 0xac;  /* OP_CHECKSIG */
+		return rv;
+	}
+}
+
 /* Subtract the `struct timeval' values X and Y,
    storing the result in RESULT.
    Return 1 if the difference is negative, otherwise 0.  */
@@ -788,7 +946,7 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 {
 	int i;
 	bool rc = true;
-	
+
 	for (i = 7; i >= 0; i--) {
 		if (hash[i] > target[i]) {
 			rc = false;
@@ -806,7 +964,7 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 	if ((!rc && opt_debug) || opt_debug_diff) {
 		uint32_t hash_be[8], target_be[8];
 		char *hash_str, *target_str;
-		
+
 		for (i = 0; i < 8; i++) {
 			be32enc(hash_be + i, hash[7 - i]);
 			be32enc(target_be + i, target[7 - i]);
@@ -882,7 +1040,7 @@ double target_to_diff(uint32_t* target)
 static bool send_line(curl_socket_t sock, char *s)
 {
 	ssize_t len, sent = 0;
-	
+
 	len = (ssize_t)strlen(s);
 	s[len++] = '\n';
 
@@ -1597,7 +1755,7 @@ static bool stratum_reconnect(struct stratum_ctx *sctx, json_t *params)
 		port = (int) json_integer_value(port_val);
 	if (!host || !port)
 		return false;
-	
+
 	free(sctx->url);
 	sctx->url = (char*)malloc(32 + strlen(host));
 	sprintf(sctx->url, "stratum+tcp://%s:%d", host, port);
@@ -1800,7 +1958,7 @@ static bool stratum_show_message(struct stratum_ctx *sctx, json_t *id, json_t *p
 	val = json_array_get(params, 0);
 	if (val)
 		applog(LOG_NOTICE, "MESSAGE FROM SERVER: %s", json_string_value(val));
-	
+
 	if (!id || json_is_null(id))
 		return true;
 
@@ -2293,7 +2451,7 @@ void print_hash_tests(void)
 
 	sha256q_hash(&hash[0], &buf[0]);
 	printpfx("sha256q", hash);
-  
+
 	sia_blake2b_hash(&hash[0], &buf[0]);
 	printpfx("sia", hash);
 
@@ -2320,7 +2478,7 @@ void print_hash_tests(void)
 
 	bitcore_hash(&hash[0], &buf[0]);
 	printpfx("bitcore", hash);
-	
+
 	exosis_hash(&hash[0], &buf[0]);
 	printpfx("exosis", hash);
 

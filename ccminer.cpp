@@ -98,6 +98,10 @@ bool allow_gbt = true;
 bool allow_mininginfo = true;
 bool check_dups = true; //false;
 bool check_stratum_jobs = false;
+
+bool have_gbt = true;
+bool allow_getwork = false;
+
 bool opt_submit_stale = false;
 bool submit_old = false;
 bool use_syslog = false;
@@ -177,6 +181,10 @@ char *rpc_user = NULL;
 char *rpc_pass;
 char *rpc_url;
 char *short_url = NULL;
+
+static unsigned char pk_script[25] = { 0 };
+static size_t pk_script_size = 0;
+static char coinbase_sig[101] = { 0 };
 
 struct stratum_ctx stratum = { 0 };
 pthread_mutex_t stratum_sock_lock;
@@ -340,6 +348,9 @@ Options:\n\
   -n, --ndevs           list cuda devices\n\
   -N, --statsavg        number of samples used to compute hashrate (default: 30)\n\
       --no-gbt          disable getblocktemplate support (height check in solo)\n\
+      --coinbase-addr=ADDR  payout address for solo mining\n\
+      --coinbase-sig=TEXT  data to insert in the coinbase when possible\n\
+      --no-getwork      disable getwork support\n\
       --no-longpoll     disable X-Long-Polling support\n\
       --no-stratum      disable X-Stratum support\n\
       --no-extranonce   disable extranonce subscribe on stratum\n\
@@ -409,6 +420,9 @@ struct option options[] = {
 	{ "cert", 1, NULL, 1001 },
 	{ "config", 1, NULL, 'c' },
 	{ "cputest", 0, NULL, 1006 },
+    { "no-getwork", 0, NULL, 1010 },
+    { "coinbase-addr", 1, NULL, 1016 },
+    { "coinbase-sig", 1, NULL, 1015 },
 	{ "cpu-affinity", 1, NULL, 1020 },
 	{ "cpu-priority", 1, NULL, 1021 },
 	{ "cuda-schedule", 1, NULL, 1025 },
@@ -450,7 +464,6 @@ struct option options[] = {
 	{ "retry-pause", 1, NULL, 'R' },
 	{ "scantime", 1, NULL, 's' },
 	{ "show-diff", 0, NULL, 1013 }, // deprecated
-	{ "submit-stale", 0, NULL, 1015 },
 	{ "hide-diff", 0, NULL, 1014 },
 	{ "statsavg", 1, NULL, 'N' },
 	{ "gpu-clock", 1, NULL, 1070 },
@@ -517,6 +530,7 @@ Boolberry specific options:\n\
 struct work _ALIGN(64) g_work;
 volatile time_t g_work_time;
 pthread_mutex_t g_work_lock;
+static char *lp_id;
 
 // get const array size (defined in ccminer.cpp)
 int options_count()
@@ -708,23 +722,19 @@ static bool work_decode(const json_t *val, struct work *work)
 	int i;
 
 	switch (opt_algo) {
+	case ALGO_M7:
+		data_size = 122;
+		adata_sz = data_size / 4;
+		break;
 	case ALGO_DECRED:
 		data_size = 192;
 		adata_sz = 180/4;
-		break;
-	case ALGO_PHI2:
-		data_size = 144;
-		adata_sz = data_size / 4;
 		break;
 	case ALGO_NEOSCRYPT:
 	case ALGO_ZR5:
 		data_size = 80;
 		adata_sz = data_size / 4;
 		break;
-	case ALGO_CRYPTOLIGHT:
-	case ALGO_CRYPTONIGHT:
-	case ALGO_WILDKECCAK:
-		return rpc2_job_decode(val, work);
 	default:
 		data_size = 128;
 		adata_sz = data_size / 4;
@@ -761,12 +771,6 @@ static bool work_decode(const json_t *val, struct work *work)
 	for (i = 0; i < atarget_sz; i++)
 		work->target[i] = le32dec(work->target + i);
 
-	if (opt_algo == ALGO_PHI2) {
-		for (i = 20; i < 36; i++) if (work->data[i]) {
-			use_roots = 1; break;
-		}
-	}
-
 	if ((opt_showdiff || opt_max_diff > 0.) && !allow_mininginfo)
 		calc_network_diff(work);
 
@@ -796,8 +800,8 @@ static bool work_decode(const json_t *val, struct work *work)
 					work->tx_count = 0;
 					break;
 				}
-				hex2bin((uchar*)work->txs[tx].data, hexstr, min(txlen, POK_MAX_TX_SZ));
-				work->txs[tx].len = (uint32_t) (txlen);
+				hex2bin((uchar*)work->txspok[tx].data, hexstr, min(txlen, POK_MAX_TX_SZ));
+				work->txspok[tx].len = (uint32_t) (txlen);
 				totlen += txlen;
 			}
 			if (opt_debug)
@@ -1137,8 +1141,734 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	return true;
 }
 
-/* simplified method to only get some extra infos in solo mode */
+#define BLOCK_VERSION_CURRENT 3
+// to fix
 static bool gbt_work_decode(const json_t *val, struct work *work)
+{
+	int i, n;
+	uint32_t version, curtime, bits;
+	uint32_t prevhash[8];
+	uint32_t target[8];
+	int cbtx_size;
+	uchar *cbtx = NULL;
+	int tx_count, tx_size;
+	uchar txc_vi[9];
+	uchar(*merkle_tree)[32] = NULL;
+	bool coinbase_append = false;
+	bool submit_coinbase = false;
+	bool version_force = false;
+	bool version_reduce = false;
+	json_t *tmp, *txa;
+	bool rc = false;
+
+	tmp = json_object_get(val, "mutable");
+	if (tmp && json_is_array(tmp)) {
+		n = (int)json_array_size(tmp);
+		for (i = 0; i < n; i++) {
+			const char *s = json_string_value(json_array_get(tmp, i));
+			if (!s)
+				continue;
+			if (!strcmp(s, "coinbase/append"))
+				coinbase_append = true;
+			else if (!strcmp(s, "submit/coinbase"))
+				submit_coinbase = true;
+			else if (!strcmp(s, "version/force"))
+				version_force = true;
+			else if (!strcmp(s, "version/reduce"))
+				version_reduce = true;
+		}
+	}
+
+	tmp = json_object_get(val, "height");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid height");
+		goto out;
+	}
+	work->height = (int)json_integer_value(tmp);
+	applog(LOG_BLUE, "Current block is %d", work->height);
+
+	tmp = json_object_get(val, "version");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid version");
+		goto out;
+	}
+	version = (uint32_t)json_integer_value(tmp);
+	if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
+		if (version_reduce) {
+			version = (version & ~0xffU) | BLOCK_VERSION_CURRENT;
+		}
+		else if (have_gbt && allow_getwork && !version_force) {
+			applog(LOG_DEBUG, "Switching to getwork, gbt version %d", version);
+			have_gbt = false;
+			goto out;
+		}
+		else if (!version_force) {
+			applog(LOG_ERR, "Unrecognized block version: %u", version);
+			goto out;
+		}
+	}
+
+	if (unlikely(!jobj_binary(val, "previousblockhash", prevhash, sizeof(prevhash)))) {
+		applog(LOG_ERR, "JSON invalid previousblockhash");
+		goto out;
+	}
+
+	tmp = json_object_get(val, "curtime");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid curtime");
+		goto out;
+	}
+	curtime = (uint32_t)json_integer_value(tmp);
+
+	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
+		applog(LOG_ERR, "JSON invalid bits");
+		goto out;
+	}
+
+	// find count and size of transactions
+	txa = json_object_get(val, "transactions");
+	if (!txa || !json_is_array(txa)) {
+		applog(LOG_ERR, "JSON invalid transactions");
+		goto out;
+	}
+	tx_count = (int)json_array_size(txa);
+	tx_size = 0;
+	for (i = 0; i < tx_count; i++) {
+		const json_t *tx = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tx, "data"));
+		if (!tx_hex) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			goto out;
+		}
+		tx_size += (int)(strlen(tx_hex) / 2);
+	}
+
+	// build coinbase transaction
+	tmp = json_object_get(val, "coinbasetxn");
+	if (tmp) {
+//printf("printf coinbase txn\n");
+		const char *cbtx_hex = json_string_value(json_object_get(tmp, "data"));
+		cbtx_size = cbtx_hex ? (int)strlen(cbtx_hex) / 2 : 0;
+		cbtx = (uchar*)malloc(cbtx_size + 100);
+		if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
+			applog(LOG_ERR, "JSON invalid coinbasetxn");
+			goto out;
+		}
+	}
+	else {
+		int64_t cbvalue;
+		if (!pk_script_size) {
+			if (allow_getwork) {
+				applog(LOG_INFO, "No payout address provided, switching to getwork");
+				have_gbt = false;
+			}
+			else
+				applog(LOG_ERR, "No payout address provided");
+			goto out;
+		}
+		tmp = json_object_get(val, "coinbasevalue");
+		if (!tmp || !json_is_number(tmp)) {
+			applog(LOG_ERR, "JSON invalid coinbasevalue");
+			goto out;
+		}
+		cbvalue = (int64_t)(json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp));
+		cbtx = (uchar*)malloc(256);
+		le32enc((uint32_t *)cbtx, 1); // version /
+		cbtx[4] = 1; // in-counter /
+		memset(cbtx + 5, 0x00, 32); // prev txout hash /
+		le32enc((uint32_t *)(cbtx + 37), 0xffffffff); // prev txout index /
+		cbtx_size = 43;
+		// BIP 34: height in coinbase /
+		for (n = work->height; n; n >>= 8)
+			cbtx[cbtx_size++] = n & 0xff;
+		cbtx[42] = cbtx_size - 43;
+		cbtx[41] = cbtx_size - 42; // scriptsig length /
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0xffffffff); // sequence /
+		cbtx_size += 4;
+
+		cbtx[cbtx_size++] = 1; // out-counter /
+
+		le32enc((uint32_t *)(cbtx + cbtx_size), (uint32_t)cbvalue); // value /
+		le32enc((uint32_t *)(cbtx + cbtx_size + 4), cbvalue >> 32);
+		cbtx_size += 8;
+		cbtx[cbtx_size++] = (uint8_t)pk_script_size; // txout-script length /
+		memcpy(cbtx + cbtx_size, pk_script, pk_script_size);
+		cbtx_size += (int)pk_script_size;
+
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0); // lock time /
+		cbtx_size += 4;
+
+		coinbase_append = true;
+	}
+	if (coinbase_append) {
+		unsigned char xsig[100];
+		int xsig_len = 0;
+		if (*coinbase_sig) {
+			n = (int)strlen(coinbase_sig);
+			if (cbtx[41] + xsig_len + n <= 100) {
+				memcpy(xsig + xsig_len, coinbase_sig, n);
+				xsig_len += n;
+			}
+			else {
+				applog(LOG_WARNING, "Signature does not fit in coinbase, skipping");
+			}
+		}
+		tmp = json_object_get(val, "coinbaseaux");
+		if (tmp && json_is_object(tmp)) {
+			void *iter = json_object_iter(tmp);
+			while (iter) {
+				unsigned char buf[100];
+				const char *s = json_string_value(json_object_iter_value(iter));
+				n = s ? (int)(strlen(s) / 2) : 0;
+				if (!s || n > 100 || !hex2bin(buf, s, n)) {
+					applog(LOG_ERR, "JSON invalid coinbaseaux");
+					break;
+				}
+				if (cbtx[41] + xsig_len + n <= 100) {
+					memcpy(xsig + xsig_len, buf, n);
+					xsig_len += n;
+				}
+				iter = json_object_iter_next(tmp, iter);
+			}
+		}
+		if (xsig_len) {
+			unsigned char *ssig_end = cbtx + 42 + cbtx[41];
+			int push_len = cbtx[41] + xsig_len < 76 ? 1 :
+				cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
+			n = xsig_len + push_len;
+			memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
+			cbtx[41] += n;
+			if (push_len == 2)
+				*(ssig_end++) = 0x4c;
+			if (push_len)
+				*(ssig_end++) = xsig_len;
+			memcpy(ssig_end, xsig, xsig_len);
+			cbtx_size += n;
+		}
+	}
+
+	n = varint_encode(txc_vi, 1 + tx_count);
+	work->txs = (char*)malloc(2 * (n + cbtx_size + tx_size) + 1);
+	dbin2hex(work->txs, txc_vi, n);
+	dbin2hex(work->txs + 2 * n, cbtx, cbtx_size);
+
+	// generate merkle root
+	merkle_tree = (uchar(*)[32]) calloc(((1 + tx_count + 1) & ~1), 32);
+
+
+
+
+	sha256d(merkle_tree[0], cbtx, cbtx_size);
+
+
+	for (i = 0; i < tx_count; i++) {
+		tmp = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const int tx_size = tx_hex ? (int)(strlen(tx_hex) / 2) : 0;
+		unsigned char *tx = (uchar*)malloc(tx_size);
+		if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			free(tx);
+			goto out;
+		}
+		sha256d(merkle_tree[1 + i], tx, tx_size);
+		if (!submit_coinbase)
+			strcat(work->txs, tx_hex);
+	}
+	n = 1 + tx_count;
+	while (n > 1) {
+		if (n % 2) {
+			memcpy(merkle_tree[n], merkle_tree[n - 1], 32);
+			++n;
+		}
+		n /= 2;
+		for (i = 0; i < n; i++)
+			sha256d(merkle_tree[i], merkle_tree[2 * i], 64);
+	}
+
+	// assemble block header
+	work->data[0] = swab32(version);
+	for (i = 0; i < 8; i++)
+		work->data[8 - i] = le32dec(prevhash + i);
+	for (i = 0; i < 8; i++)
+		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
+	work->data[17] = swab32(curtime);
+	work->data[18] = le32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
+
+	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
+		applog(LOG_ERR, "JSON invalid target");
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);
+
+	tmp = json_object_get(val, "workid");
+	if (tmp) {
+		if (!json_is_string(tmp)) {
+			applog(LOG_ERR, "JSON invalid workid");
+			goto out;
+		}
+		work->workid = strdup(json_string_value(tmp));
+	}
+
+	rc = true;
+out:
+	// Long polling
+	tmp = json_object_get(val, "longpollid");
+	if (want_longpoll && json_is_string(tmp)) {
+		free(lp_id);
+		lp_id = strdup(json_string_value(tmp));
+		if (!have_longpoll) {
+			char *lp_uri;
+			tmp = json_object_get(val, "longpolluri");
+			lp_uri = json_is_string(tmp) ? strdup(json_string_value(tmp)) : rpc_url;
+			have_longpoll = true;
+			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
+		}
+	}
+
+	free(merkle_tree);
+	free(cbtx);
+	return rc;
+}
+
+
+static bool gbt_work_decode_mtp(const json_t *val, struct work *work)
+{
+
+//restart_threads();
+	int i, n;
+	uint32_t version, curtime, bits;
+	uint32_t prevhash[8];
+	uint32_t target[8];
+	int cbtx_size;
+	uchar *cbtx = NULL;
+	int32_t mtpVersion = 0x1000;
+
+	int tx_count, tx_size;
+	uchar txc_vi[9];
+	uchar(*merkle_tree)[32] = NULL;
+	bool coinbase_append = false;
+	bool submit_coinbase = false;
+	bool version_force = false;
+	bool version_reduce = false;
+	json_t *tmp, *txa;
+	json_t *mpay;
+	json_t *mnval;
+	json_t *mnamount;
+	json_t *mnaddy;
+	json_t *mnscript;
+	bool rc = false;
+
+	tmp = json_object_get(val, "mutable");
+	if (tmp && json_is_array(tmp)) {
+		n = (int)json_array_size(tmp);
+		for (i = 0; i < n; i++) {
+			const char *s = json_string_value(json_array_get(tmp, i));
+			if (!s)
+				continue;
+			if (!strcmp(s, "coinbase/append"))
+				coinbase_append = true;
+			else if (!strcmp(s, "submit/coinbase"))
+				submit_coinbase = true;
+			else if (!strcmp(s, "version/force"))
+				version_force = true;
+			else if (!strcmp(s, "version/reduce"))
+				version_reduce = true;
+		}
+	}
+
+	tmp = json_object_get(val, "height");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid height");
+		goto out;
+	}
+	if (work->height == (int)json_integer_value(tmp))
+							return false;
+
+	work->height = (int)json_integer_value(tmp);
+	applog(LOG_BLUE, "Current block is %d", work->height);
+
+	tmp = json_object_get(val, "version");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid version");
+		goto out;
+	}
+	version = (uint32_t)json_integer_value(tmp);
+	if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
+		if (version_reduce) {
+			version = (version & ~0xffU) | BLOCK_VERSION_CURRENT;
+		}
+		else if (have_gbt && allow_getwork && !version_force) {
+			applog(LOG_DEBUG, "Switching to getwork, gbt version %d", version);
+			have_gbt = false;
+			goto out;
+		}
+		else if (!version_force) {
+			applog(LOG_ERR, "Unrecognized block version: %u", version);
+			goto out;
+		}
+	}
+
+	if (unlikely(!jobj_binary(val, "previousblockhash", prevhash, sizeof(prevhash)))) {
+		applog(LOG_ERR, "JSON invalid previousblockhash");
+		goto out;
+	}
+
+	tmp = json_object_get(val, "curtime");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid curtime");
+		goto out;
+	}
+
+// random seed initialized with time and pid
+#ifdef _MSC_VER
+	srand(time(NULL) - _getpid());
+#elif __GNUC__
+	srand(time(NULL) - getpid());
+#endif
+
+	uint32_t ranraw[1];
+	ranraw[0] = (uint32_t)rand();
+
+	curtime = (uint32_t)json_integer_value(tmp);
+
+	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
+		applog(LOG_ERR, "JSON invalid bits");
+		goto out;
+	}
+
+	// find count and size of transactions
+	txa = json_object_get(val, "transactions");
+	if (!txa || !json_is_array(txa)) {
+		applog(LOG_ERR, "JSON invalid transactions");
+		goto out;
+	}
+	tx_count = (int)json_array_size(txa);
+	tx_size = 0;
+	for (i = 0; i < tx_count; i++) {
+		const json_t *tx = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tx, "data"));
+		if (!tx_hex) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			goto out;
+		}
+		tx_size += (int)(strlen(tx_hex) / 2);
+	}
+
+	// build coinbase transaction
+	tmp = json_object_get(val, "coinbasetxn");
+	if (tmp) {
+		const char *cbtx_hex = json_string_value(json_object_get(tmp, "data"));
+		cbtx_size = cbtx_hex ? (int)strlen(cbtx_hex) / 2 : 0;
+		cbtx = (uchar*)malloc(cbtx_size + 100);
+		if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
+			applog(LOG_ERR, "JSON invalid coinbasetxn");
+			goto out;
+		}
+	}
+	else {
+		int64_t cbvalue;
+		if (!pk_script_size) {
+			if (allow_getwork) {
+				applog(LOG_INFO, "No payout address provided, switching to getwork");
+				have_gbt = false;
+			}
+			else
+				applog(LOG_ERR, "No payout address provided");
+			goto out;
+		}
+		tmp = json_object_get(val, "coinbasevalue");
+		if (!tmp || !json_is_number(tmp)) {
+			applog(LOG_ERR, "JSON invalid coinbasevalue");
+			goto out;
+		}
+		mpay = json_object_get(val,"znode_payments_started");
+//		mpay = false;
+		if (mpay) {
+		mnval = json_object_get(val, "znode");
+			mnamount = json_object_get(mnval,"amount");
+			mnaddy = json_object_get(mnval, "payee");
+			mnscript = json_object_get(mnval, "script");
+/*
+		printf("mn addy %s", json_string_value(mnaddy));
+		printf("mn amount %d", json_integer_value(mnamount));
+		printf("mn script %d", json_string_value(mnscript));
+*/
+		}
+		cbvalue = (int64_t)(json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp));
+		cbvalue = (uint32_t)cbvalue - (uint32_t)7000000;
+		cbtx = (uchar*)malloc(256*256);
+		le32enc((uint32_t *)cbtx, 1); // version /
+		cbtx[4] = 1; // in-counter /
+		memset(cbtx + 5, 0x00, 32); // prev txout hash /
+		le32enc((uint32_t *)(cbtx + 37), 0xffffffff); // prev txout index /
+		cbtx_size = 43;
+		// BIP 34: height in coinbase /
+//		for (n = work->height; n; n >>= 8)
+//			cbtx[cbtx_size++] = n & 0xff;
+		cbtx[cbtx_size++] = 04;
+		for (int i=0;i<4;i++)
+		cbtx[cbtx_size++] = ((unsigned char*)ranraw)[i];
+		cbtx[42] = cbtx_size - 43;
+		cbtx[41] = cbtx_size - 42; // scriptsig length /
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0xffffffff); // sequence /
+		cbtx_size += 4;
+
+		cbtx[cbtx_size++] = (mpay && json_integer_value(mnamount)!=0)? 8:7; // out-counter /
+
+		le32enc((uint32_t *)(cbtx + cbtx_size), (uint32_t)cbvalue); // value /
+		le32enc((uint32_t *)(cbtx + cbtx_size + 4), cbvalue >> 32);
+		cbtx_size += 8;
+		cbtx[cbtx_size++] = (uint8_t)pk_script_size; // txout-script length /
+		memcpy(cbtx + cbtx_size, pk_script, pk_script_size);
+		cbtx_size += (int)pk_script_size;
+////// null data
+//		le32enc((uint32_t *)(cbtx + cbtx_size), (uint32_t)0); // value /
+//		le32enc((uint32_t *)(cbtx + cbtx_size + 4), 0 >> 32);
+//		cbtx_size += 8;
+//		cbtx[cbtx_size++] = (uint8_t)pk_null_size; // txout-script length /
+//		memcpy(cbtx + cbtx_size, pk_null, pk_null_size);
+//		cbtx_size += (int)pk_null_size;
+
+		/// append here dev fee and masternode payment ////
+		/*   test */
+		char coinb0[90] = { 0 };
+		char coinb1[74] = { 0 };
+		char coinb2[74] = { 0 };
+		char coinb3[74] = { 0 };
+		char coinb4[74] = { 0 };
+		char coinb5[74] = { 0 };
+		char coinb51[74] = { 0 };
+		char coinb6[74] = { 0 };
+		char coinb7[90] = { 0 };
+		char script_payee[1024];
+
+
+		  // for mainnet
+
+		base58_decode("aCAgTPgtYcA4EysU4UKC86EQd5cTtHtCcr", script_payee);
+		job_pack_tx(coinb1, 50000000, script_payee);
+
+		base58_decode("aHu897ivzmeFuLNB6956X6gyGeVNHUBRgD", script_payee);
+		job_pack_tx(coinb2, 50000000, script_payee);
+
+		base58_decode("aQ18FBVFtnueucZKeVg4srhmzbpAeb1KoN", script_payee);
+		job_pack_tx(coinb3, 50000000, script_payee);
+
+		base58_decode("a1HwTdCmQV3NspP2QqCGpehoFpi8NY4Zg3", script_payee);
+		job_pack_tx(coinb4, 150000000, script_payee);
+
+		base58_decode("a1kCCGddf5pMXSipLVD9hBG2MGGVNaJ15U", script_payee);
+		job_pack_tx(coinb5, 50000000, script_payee);
+
+		base58_decode("aChWVb8CpgajadpLmiwDZvZaKizQgHxfh5", script_payee);
+		job_pack_tx(coinb51, 7000000, script_payee);
+/*
+		// for testnet with znode payment
+		base58_decode("TDk19wPKYq91i18qmY6U9FeTdTxwPeSveo", script_payee);
+		job_pack_tx(coinb1, 50000000, script_payee);
+
+		base58_decode("TWZZcDGkNixTAMtRBqzZkkMHbq1G6vUTk5", script_payee);
+		job_pack_tx(coinb2, 50000000, script_payee);
+
+		base58_decode("TRZTFdNCKCKbLMQV8cZDkQN9Vwuuq4gDzT", script_payee);
+		job_pack_tx(coinb3, 50000000, script_payee);
+
+		base58_decode("TG2ruj59E5b1u9G3F7HQVs6pCcVDBxrQve", script_payee);
+		job_pack_tx(coinb4, 150000000, script_payee);
+
+		base58_decode("TCsTzQZKVn4fao8jDmB9zQBk9YQNEZ3XfS", script_payee);
+		job_pack_tx(coinb5, 50000000, script_payee);
+*/
+
+		if (mpay && json_integer_value(mnamount)!=0) {
+		base58_decode((char*)json_string_value(mnaddy), script_payee);
+//		memcpy(script_payee, json_string_value(mnscript),strlen(json_string_value(mnscript)));
+		job_pack_tx(coinb6, json_integer_value(mnamount), script_payee);
+		}
+
+/*
+		"payee": "TQd92H738k7QpEpYPrEFrHDoawsJjW4XhT",
+			"script" : "76a914a0be3efc7cec6597a0c1c01037fc19e99c7b707f88ac",
+			"amount" : 750000000
+*/
+
+		strcat(coinb7, "00000000"); // locktime
+
+		hex2bin(cbtx + cbtx_size, coinb1, strlen(coinb1));
+		cbtx_size = cbtx_size + (int)((strlen(coinb1)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb2, strlen(coinb2));
+		cbtx_size = cbtx_size + (int)((strlen(coinb2)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb3, strlen(coinb3));
+		cbtx_size = cbtx_size + (int)((strlen(coinb3)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb4, strlen(coinb4));
+		cbtx_size = cbtx_size + (int)((strlen(coinb4)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb5, strlen(coinb5));
+		cbtx_size = cbtx_size + (int)((strlen(coinb5)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb51, strlen(coinb51));
+		cbtx_size = cbtx_size + (int)((strlen(coinb51)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb6, strlen(coinb6));
+		cbtx_size = cbtx_size + (int)((strlen(coinb6)) / 2);
+
+		hex2bin(cbtx + cbtx_size, coinb7, strlen(coinb7));
+		cbtx_size = cbtx_size + (int)((strlen(coinb7)) / 2);
+		coinbase_append = true;
+	}
+	if (coinbase_append) {
+		unsigned char xsig[100];
+		int xsig_len = 0;
+		if (*coinbase_sig) {
+			n = (int)strlen(coinbase_sig);
+			if (cbtx[41] + xsig_len + n <= 100) {
+				memcpy(xsig + xsig_len, coinbase_sig, n);
+				xsig_len += n;
+			}
+			else {
+				applog(LOG_WARNING, "Signature does not fit in coinbase, skipping");
+			}
+		}
+		tmp = json_object_get(val, "coinbaseaux");
+		if (tmp && json_is_object(tmp)) {
+			void *iter = json_object_iter(tmp);
+			while (iter) {
+				unsigned char buf[100];
+				const char *s = json_string_value(json_object_iter_value(iter));
+				n = s ? (int)(strlen(s) / 2) : 0;
+				if (!s || n > 100 || !hex2bin(buf, s, n)) {
+					applog(LOG_ERR, "JSON invalid coinbaseaux");
+					break;
+				}
+				if (cbtx[41] + xsig_len + n <= 100) {
+					memcpy(xsig + xsig_len, buf, n);
+					xsig_len += n;
+				}
+				iter = json_object_iter_next(tmp, iter);
+			}
+		}
+		if (xsig_len) {
+			unsigned char *ssig_end = cbtx + 42 + cbtx[41];
+			int push_len = cbtx[41] + xsig_len < 76 ? 1 :
+				cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
+			n = xsig_len + push_len;
+			memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
+			cbtx[41] += n;
+			if (push_len == 2)
+				*(ssig_end++) = 0x4c;
+			if (push_len)
+				*(ssig_end++) = xsig_len;
+			memcpy(ssig_end, xsig, xsig_len);
+			cbtx_size += n;
+		}
+	}
+
+	n = varint_encode(txc_vi, 1 + tx_count);
+	work->txs = (char*)malloc(2 * (n + cbtx_size + tx_size) + 1);
+	dbin2hex(work->txs, txc_vi, n);
+	dbin2hex(work->txs + 2 * n, cbtx, cbtx_size);
+
+	// generate merkle root
+	merkle_tree = (uchar(*)[32]) calloc(((1 + tx_count + 1) & ~1), 32);
+
+	sha256d(merkle_tree[0], cbtx, cbtx_size);
+
+	for (i = 0; i < tx_count; i++) {
+		tmp = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const int tx_size = tx_hex ? (int)(strlen(tx_hex) / 2) : 0;
+		unsigned char *tx = (uchar*)malloc(tx_size);
+		if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			free(tx);
+			goto out;
+		}
+		sha256d(merkle_tree[1 + i], tx, tx_size);
+		if (!submit_coinbase)
+			strcat(work->txs, tx_hex);
+	}
+	n = 1 + tx_count;
+	while (n > 1) {
+		if (n % 2) {
+			memcpy(merkle_tree[n], merkle_tree[n - 1], 32);
+			++n;
+		}
+		n /= 2;
+		for (i = 0; i < n; i++)
+			sha256d(merkle_tree[i], merkle_tree[2 * i], 64);
+	}
+
+	// assemble block header
+	work->data[0] = (version);
+	for (i = 0; i < 8; i++)
+		work->data[8 - i] = be32dec(prevhash + i);
+	for (i = 0; i < 8; i++)
+		work->data[9 + i] = le32dec((uint32_t *)merkle_tree[0] + i);
+	work->data[17] = (curtime);
+	work->data[18] = be32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+/************************************************************************/
+//mtp stuff
+
+	work->data[20] = (mtpVersion);
+/*************************************************************************/
+
+//	work->data[20] = 0x80000000;
+//	work->data[20] = 0x80000000;
+//	work->data[31] = 0x000002A0;
+
+	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
+		applog(LOG_ERR, "JSON invalid target");
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);
+
+		work->targetdiff = target_to_diff(work->target);
+
+	tmp = json_object_get(val, "workid");
+	if (tmp) {
+		if (!json_is_string(tmp)) {
+			applog(LOG_ERR, "JSON invalid workid");
+			goto out;
+		}
+		work->workid = strdup(json_string_value(tmp));
+	}
+
+	rc = true;
+out:
+	// Long polling
+	tmp = json_object_get(val, "longpollid");
+	if (want_longpoll && json_is_string(tmp)) {
+		free(lp_id);
+		lp_id = strdup(json_string_value(tmp));
+		if (!have_longpoll) {
+			char *lp_uri;
+			tmp = json_object_get(val, "longpolluri");
+			lp_uri = json_is_string(tmp) ? strdup(json_string_value(tmp)) : rpc_url;
+			have_longpoll = true;
+			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
+		}
+	}
+
+	free(merkle_tree);
+	free(cbtx);
+	return rc;
+}
+
+
+
+/* simplified method to only get some extra infos in solo mode */
+static bool gbt_info(const json_t *val, struct work *work)
 {
 	json_t *err = json_object_get(val, "error");
 	if (err && !json_is_null(err)) {
@@ -1614,7 +2344,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 #endif
 			sha256d(merkle_root, merkle_root, 64);
 	}
-	
+
 	/* Increment extranonce2 */
 	for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
 
@@ -3075,7 +3805,7 @@ wait_stratum_url:
 			}
 			pthread_mutex_unlock(&g_work_lock);
 		}
-		
+
 		// check we are on the right pool
 		if (switchn != pool_switch_count) goto pool_switched;
 
@@ -3647,6 +4377,9 @@ void parse_arg(int key, char *arg)
 	case 1009:
 		opt_shares_limit = atoi(arg);
 		break;
+	case 1010:
+		allow_getwork = false;
+		break;
 	case 1011:
 		allow_gbt = false;
 		break;
@@ -3659,8 +4392,19 @@ void parse_arg(int key, char *arg)
 	case 1014:
 		opt_showdiff = false;
 		break;
-	case 1015:
-		opt_submit_stale = true;
+	case 1016:			/* --coinbase-addr */
+		pk_script_size = address_to_script(pk_script, sizeof(pk_script), arg);
+		if (!pk_script_size) {
+			fprintf(stderr, "invalid address -- '%s'\n", arg);
+			show_usage_and_exit(1);
+		}
+		break;
+	case 1015:			/* --coinbase-sig */
+		if (strlen(arg) + 1 > sizeof(coinbase_sig)) {
+			fprintf(stderr, "coinbase signature too long\n");
+			show_usage_and_exit(1);
+		}
+		strcpy(coinbase_sig, arg);
 		break;
 	case 'S':
 	case 1018:

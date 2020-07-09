@@ -644,8 +644,15 @@ extern void gpulog(int prio, int thr_id, const char *fmt, ...);
 
 void get_defconfig_path(char *out, size_t bufsize, char *argv0);
 extern void cbin2hex(char *out, const char *in, size_t len);
+extern void dbin2hex(char *s, const unsigned char *p, size_t len);
 extern char *bin2hex(const unsigned char *in, size_t len);
 extern bool hex2bin(void *output, const char *hexstr, size_t len);
+
+extern bool jobj_binary(const json_t *obj, const char *key, void *buf, size_t buflen);
+int varint_encode(unsigned char *p, uint64_t n);
+size_t address_to_script(unsigned char *out, size_t outsz, const char *addr);
+size_t nulldata_to_script(unsigned char *out, unsigned char *mess);
+
 extern int timeval_subtract(struct timeval *result, struct timeval *x,
 	struct timeval *y);
 extern bool fulltest(const uint32_t *hash, const uint32_t *target);
@@ -751,13 +758,15 @@ struct work {
 	double targetdiff;
 
 	uint32_t height;
+    char *txs;
+	char *workid;
 
 	uint32_t scanned_from;
 	uint32_t scanned_to;
 
 	/* pok getwork txs */
 	uint32_t tx_count;
-	struct tx txs[POK_MAX_TXS];
+	struct tx txspok[POK_MAX_TXS];
 	// zec solution
 	uint8_t extra[1388];
 };
@@ -814,6 +823,11 @@ struct pool_infos {
 extern struct pool_infos pools[MAX_POOLS];
 extern int num_pools;
 extern volatile int cur_pooln;
+
+/*************** base decode **********************/
+extern bool base58_decode(const char *input, char *output);
+extern void encode_tx_value(char *encoded, json_int_t value);
+extern void job_pack_tx(char *data, json_int_t amount, char *key);
 
 void pool_init_defaults(void);
 void pool_set_creds(int pooln);
